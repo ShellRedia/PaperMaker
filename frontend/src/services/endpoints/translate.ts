@@ -82,7 +82,9 @@ export const translateApi = {
   /** 获取文档的翻译历史 */
   async getHistory(documentId: string): Promise<TranslationRecord[]> {
     const res = await api.get(`/translate/history/${documentId}`)
-    return (res.data?.data || []) as TranslationRecord[]
+    // axios 响应拦截器已返回 body，所以 res 就是 {code, data, message}
+    // res.data 才是 TranslationRecord[] 数组
+    return (res.data || []) as TranslationRecord[]
   },
 
   /** 清空文档的翻译历史 */

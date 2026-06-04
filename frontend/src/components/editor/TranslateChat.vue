@@ -267,8 +267,8 @@ async function loadHistory() {
       }
     }
     totalUsage.value = usage
-  } catch {
-    // 加载失败时静默
+  } catch (e: any) {
+    console.error('[TranslateChat] 加载历史失败:', e.message || e)
   }
 }
 

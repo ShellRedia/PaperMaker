@@ -223,6 +223,7 @@ async def translate_text_stream(
             parsed = json.loads(clean)
             result = {"english": parsed.get("english", ""), "chinese": parsed.get("chinese", "")}
         except json.JSONDecodeError:
+            logger.warning(f"LLM 返回非JSON内容 (len={len(buffer)}), 使用原始内容作为英文翻译")
             result = {"english": buffer, "chinese": ""}
 
         # ── 持久化 ──
