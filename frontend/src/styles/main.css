@@ -1,0 +1,61 @@
+@import "./variables.css";
+@import "./anime-utils.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── 全局基础样式 ── */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg-app, #020617);
+  color: var(--text-secondary, #e2e8f0);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── 滚动条样式 ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-default, #334155);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted, #64748b);
+}
+
+/* ── 选中样式 ── */
+::selection {
+  background: rgba(59, 130, 246, 0.4);
+  color: white;
+}
+
+/* ── 输入框聚焦光晕 ── */
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
+  transition: box-shadow var(--anime-duration-fast, 250ms) var(--anime-easing-out, ease);
+}
+
+/* ── Monaco 编辑器容器 ── */
+.monaco-editor-container {
+  height: 100%;
+  width: 100%;
+}

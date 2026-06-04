@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.spec.bak
+.Python
+env/
+venv/
+.venv/
+
+# Node / Vite
+node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PaperMaker
+backend/static/
+*.db
+*.db-journal
+*.db-wal
+
+# PyInstaller
+*.manifest
+*.exe
