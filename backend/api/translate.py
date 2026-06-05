@@ -1,4 +1,4 @@
-"""LLM 翻译 API — 中→英翻译润色→中 + 对话历史持久化"""
+"""LLM 翻译 API — 中→英翻译润色→中 + 对话历史持久化 + 翻译规则 + 优化"""
 
 import json
 import logging
@@ -45,6 +45,118 @@ class TranslationRecord(BaseModel):
     created_at: str = ""
 
 
+# ── 翻译规则模型 ──
+
+class TranslationRuleItem(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="规则唯一ID")
+    pattern: str = Field(..., description="待匹配的原文（中文词/缩写等）", min_length=1)
+    replacement: str = Field(default="", description="替换为的目标翻译")
+    rule_type: str = Field(default="replace", description="规则类型: replace / no_translate")
+
+
+class TranslationRulesConfig(BaseModel):
+    rules: list[TranslationRuleItem] = Field(default_factory=list)
+
+
+# ── 优化请求模型 ──
+
+class RefineRequest(BaseModel):
+    original_input: str = Field(..., description="原始用户输入（中文）")
+    current_english: str = Field(..., description="当前的英文翻译")
+    refine_mode: str = Field(..., description="优化模式: concise / academic")
+    document_id: Optional[str] = Field(default=None, description="关联的文档 ID")
+
+
+# ── 翻译规则 CRUD ──
+
+RULES_KEY = "translation_rules"
+
+
+async def get_translation_rules(db: AsyncSession) -> TranslationRulesConfig:
+    """从数据库读取翻译规则"""
+    result = await db.execute(
+        select(AppSettings).where(AppSettings.key == RULES_KEY)
+    )
+    row = result.scalar_one_or_none()
+    if row and row.value:
+        try:
+            return TranslationRulesConfig.model_validate_json(row.value)
+        except (json.JSONDecodeError, Exception):
+            return TranslationRulesConfig()
+    return TranslationRulesConfig()
+
+
+async def save_translation_rules(db: AsyncSession, config: TranslationRulesConfig):
+    """保存翻译规则到数据库"""
+    from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+    value = config.model_dump_json()
+    stmt = sqlite_upsert(AppSettings).values(key=RULES_KEY, value=value).on_conflict_do_update(
+        index_elements=["key"], set_=dict(value=value, updated_at=datetime.utcnow())
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+
+def _build_rules_text(rules: list[TranslationRuleItem]) -> str:
+    """将翻译规则列表构建为可注入系统提示的文本段落"""
+    if not rules:
+        return ""
+    lines = ["\n## Translation Rules (MUST follow):"]
+    for i, r in enumerate(rules, 1):
+        if r.rule_type == "no_translate":
+            lines.append(f'{i}. Keep "{r.pattern}" UNTRANSLATED — always output it as-is without any changes.')
+        else:
+            replacement = r.replacement or "[appropriate English equivalent]"
+            lines.append(f'{i}. Translate "{r.pattern}" as "{replacement}" consistently.')
+    return "\n".join(lines)
+
+
+# ── 翻译系统提示 ──
+
+TRANSLATE_SYSTEM_PROMPT = """You are a professional academic translator. Your task is a two-step process:
+
+Step 1: Translate the user's Chinese text into polished, academic English suitable for a top-tier computer science / deep learning paper. Use the standard academic style seen in NeurIPS, ICML, CVPR, ACL papers. Ensure the English is idiomatic, precise, and natural — not a literal word-for-word translation.
+
+Step 2: Translate the polished English back into Chinese. The Chinese should reflect the improved structure and clarity of the English version.
+
+You MUST respond with a valid JSON object only, no markdown code blocks, no extra text:
+{"english": "...polished English text...", "chinese": "...back-translated Chinese text..."}"""
+
+
+# ── 优化系统提示 ──
+
+REFINE_CONCISE_PROMPT = """You are a professional academic editor. Your task is to make the given English text MORE CONCISE while preserving all key information and academic rigor.
+
+Guidelines:
+- Remove redundant words and phrases
+- Tighten sentence structures
+- Eliminate unnecessary qualifiers (very, really, quite, etc.)
+- Use shorter, more direct expressions where possible
+- Keep all technical terms and key findings intact
+- Target: reduce word count by at least 15-20% without losing meaning
+
+After refining the English, also translate it back into Chinese.
+
+You MUST respond with a valid JSON object only, no markdown code blocks, no extra text:
+{"english": "...concise English text...", "chinese": "...back-translated Chinese text..."}"""
+
+
+REFINE_ACADEMIC_PROMPT = """You are a professional academic editor. Your task is to make the given English text MORE ACADEMIC and formal, suitable for a top-tier scientific publication.
+
+Guidelines:
+- Elevate vocabulary to more formal, precise academic terms
+- Use more sophisticated sentence structures appropriate for scholarly writing
+- Add appropriate hedging where claims need qualification
+- Ensure the tone matches leading venues (NeurIPS, ICML, CVPR, ACL)
+- Maintain all technical accuracy — do not change scientific meaning
+- Use passive voice where appropriate for academic convention
+
+After refining the English, also translate it back into Chinese.
+
+You MUST respond with a valid JSON object only, no markdown code blocks, no extra text:
+{"english": "...academic English text...", "chinese": "...back-translated Chinese text..."}"""
+
+
 async def get_llm_config(db: AsyncSession) -> dict:
     """从数据库读取 LLM 配置"""
     result = await db.execute(
@@ -60,16 +172,6 @@ async def get_llm_config(db: AsyncSession) -> dict:
     }
 
 
-TRANSLATE_SYSTEM_PROMPT = """You are a professional academic translator. Your task is a two-step process:
-
-Step 1: Translate the user's Chinese text into polished, academic English suitable for a top-tier computer science / deep learning paper. Use the standard academic style seen in NeurIPS, ICML, CVPR, ACL papers. Ensure the English is idiomatic, precise, and natural — not a literal word-for-word translation.
-
-Step 2: Translate the polished English back into Chinese. The Chinese should reflect the improved structure and clarity of the English version.
-
-You MUST respond with a valid JSON object only, no markdown code blocks, no extra text:
-{"english": "...polished English text...", "chinese": "...back-translated Chinese text..."}"""
-
-
 # ═══════════════════════════════════════════════════════
 #  翻译端点
 # ═══════════════════════════════════════════════════════
@@ -79,7 +181,7 @@ async def translate_text(
     body: TranslateRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """中文 → 英文润色 → 回译中文"""
+    """中文 → 英文润色 → 回译中文（含用户翻译规则）"""
     config = await get_llm_config(db)
     if not config["api_url"]:
         raise HTTPException(status_code=400, detail="请先在设置中配置 LLM API 地址")
@@ -91,7 +193,14 @@ async def translate_text(
         "Authorization": f"Bearer {config['api_key']}",
     }
 
-    messages = [{"role": "system", "content": TRANSLATE_SYSTEM_PROMPT}]
+    # 加载翻译规则并构建动态系统提示
+    rules_config = await get_translation_rules(db)
+    rules_text = _build_rules_text(rules_config.rules)
+    system_prompt = TRANSLATE_SYSTEM_PROMPT
+    if rules_text:
+        system_prompt = TRANSLATE_SYSTEM_PROMPT + "\n" + rules_text
+
+    messages = [{"role": "system", "content": system_prompt}]
     for h in body.history:
         messages.append({"role": h.role, "content": h.content})
     messages.append({"role": "user", "content": body.text})
@@ -146,7 +255,7 @@ async def translate_text_stream(
     body: TranslateRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """流式翻译 — SSE 逐 token 返回"""
+    """流式翻译 — SSE 逐 token 返回（含用户翻译规则）"""
     config = await get_llm_config(db)
     if not config["api_url"]:
         raise HTTPException(status_code=400, detail="请先在设置中配置 LLM API 地址")
@@ -158,7 +267,14 @@ async def translate_text_stream(
         "Authorization": f"Bearer {config['api_key']}",
     }
 
-    messages = [{"role": "system", "content": TRANSLATE_SYSTEM_PROMPT}]
+    # 加载翻译规则并构建动态系统提示
+    rules_config = await get_translation_rules(db)
+    rules_text = _build_rules_text(rules_config.rules)
+    system_prompt = TRANSLATE_SYSTEM_PROMPT
+    if rules_text:
+        system_prompt = TRANSLATE_SYSTEM_PROMPT + "\n" + rules_text
+
+    messages = [{"role": "system", "content": system_prompt}]
     for h in body.history:
         messages.append({"role": h.role, "content": h.content})
     messages.append({"role": "user", "content": body.text})
@@ -242,6 +358,138 @@ async def translate_text_stream(
     )
 
 
+# ═══════════════════════════════════════════════════════
+#  优化端点 — 精简 / 学术化
+# ═══════════════════════════════════════════════════════
+
+@router.post("/refine/stream")
+async def refine_translation_stream(
+    body: RefineRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """对上一句英文翻译进行优化（精简 或 学术化），流式返回"""
+    if body.refine_mode not in ("concise", "academic"):
+        raise HTTPException(status_code=400, detail="refine_mode 必须为 concise 或 academic")
+
+    config = await get_llm_config(db)
+    if not config["api_url"]:
+        raise HTTPException(status_code=400, detail="请先在设置中配置 LLM API 地址")
+    if not config["api_key"]:
+        raise HTTPException(status_code=400, detail="请先在设置中配置 LLM API Key")
+
+    system_prompt = REFINE_CONCISE_PROMPT if body.refine_mode == "concise" else REFINE_ACADEMIC_PROMPT
+    mode_label = "精简" if body.refine_mode == "concise" else "学术化"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config['api_key']}",
+    }
+
+    user_content = f"Original Chinese input: {body.original_input}\n\nCurrent English translation to refine:\n{body.current_english}"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    payload = {
+        "model": config["model_name"] or "gpt-4o",
+        "messages": messages,
+        "temperature": 0.3,
+        "max_tokens": 4096,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    async def event_generator() -> AsyncIterator[str]:
+        buffer = ""
+        usage: dict = {}
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            async with client.stream(
+                "POST",
+                f"{config['api_url'].rstrip('/')}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status_code != 200:
+                    body_bytes = await resp.aread()
+                    yield f"data: {json.dumps({'type': 'error', 'payload': f'LLM API error ({resp.status_code}): {body_bytes.decode()[:200]}'})}\n\n"
+                    return
+
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        chunk_str = line[6:]
+                        if chunk_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(chunk_str)
+                            if "usage" in chunk and "choices" not in chunk:
+                                usage = chunk["usage"]
+                                continue
+                            delta = chunk["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if "usage" in chunk:
+                                usage = chunk["usage"]
+                            if content:
+                                buffer += content
+                                yield f"data: {json.dumps({'type': 'token', 'payload': {'token': content}})}\n\n"
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+        # 解析完整结果
+        try:
+            clean = buffer.strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                clean = "\n".join(lines[1:]) if lines[0].startswith("```") else clean
+                if clean.endswith("```"):
+                    clean = clean[:-3]
+                clean = clean.strip()
+            parsed = json.loads(clean)
+            result = {"english": parsed.get("english", ""), "chinese": parsed.get("chinese", "")}
+        except json.JSONDecodeError:
+            logger.warning(f"优化端 LLM 返回非JSON内容 (len={len(buffer)})")
+            result = {"english": buffer, "chinese": ""}
+
+        # ── 持久化优化结果（追加到最近一条 assistant 历史记录） ──
+        await _append_refine_history(body.document_id, result, usage, body.refine_mode)
+
+        yield f"data: {json.dumps({'type': 'done', 'payload': {**result, 'usage': usage, 'refine_mode': body.refine_mode}})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ═══════════════════════════════════════════════════════
+#  翻译规则 CRUD API
+# ═══════════════════════════════════════════════════════
+
+@router.get("/rules")
+async def get_rules(
+    db: AsyncSession = Depends(get_db),
+):
+    """获取用户配置的翻译规则列表"""
+    config = await get_translation_rules(db)
+    return {"code": 0, "message": "success", "data": config.model_dump()}
+
+
+@router.put("/rules")
+async def update_rules(
+    body: TranslationRulesConfig,
+    db: AsyncSession = Depends(get_db),
+):
+    """保存翻译规则列表"""
+    await save_translation_rules(db, body)
+    return {"code": 0, "message": "翻译规则已保存", "data": body.model_dump()}
+
+
 async def _save_history(
     document_id: Optional[str],
     user_text: str,
@@ -262,19 +510,83 @@ async def _save_history(
                 usage_json="",
                 created_at=now,
             ))
+            # 保存 assistant 内容，包含可能的 refines 变体
+            assistant_content = {
+                "english": result.get("english", ""),
+                "chinese": result.get("chinese", ""),
+            }
+            if result.get("refines"):
+                assistant_content["refines"] = result["refines"]
             session.add(TranslationHistory(
                 document_id=document_id,
                 role="assistant",
-                content=json.dumps({
-                    "english": result.get("english", ""),
-                    "chinese": result.get("chinese", ""),
-                }, ensure_ascii=False),
+                content=json.dumps(assistant_content, ensure_ascii=False),
                 usage_json=json.dumps(usage) if usage else "",
                 created_at=now,
             ))
             await session.commit()
     except Exception as e:
         logger.error(f"保存翻译历史失败: {e}")
+
+
+async def _append_refine_history(
+    document_id: Optional[str],
+    result: dict,
+    usage: dict,
+    refine_mode: str,
+):
+    """将优化结果追加到最近一条 assistant 翻译历史的 refines 字段"""
+    if not document_id:
+        return
+    from backend.db.database import AsyncSessionLocal
+    try:
+        async with AsyncSessionLocal() as session:
+            # 查找该文档最近一条 assistant 记录
+            r = await session.execute(
+                select(TranslationHistory)
+                .where(
+                    TranslationHistory.document_id == document_id,
+                    TranslationHistory.role == "assistant",
+                )
+                .order_by(TranslationHistory.created_at.desc())
+                .limit(1)
+            )
+            last_assistant = r.scalar_one_or_none()
+            if not last_assistant:
+                return
+
+            # 解析现有内容，追加 refines
+            content = json.loads(last_assistant.content)
+            refines = content.get("refines", [])
+            refines.append({
+                "label": "精简版" if refine_mode == "concise" else "学术版",
+                "mode": refine_mode,
+                "english": result.get("english", ""),
+                "chinese": result.get("chinese", ""),
+                "usage": usage,
+            })
+
+            content["refines"] = refines
+            last_assistant.content = json.dumps(content, ensure_ascii=False)
+
+            # 合并 usage
+            if usage:
+                existing_usage = {}
+                if last_assistant.usage_json:
+                    try:
+                        existing_usage = json.loads(last_assistant.usage_json)
+                    except json.JSONDecodeError:
+                        pass
+                merged = {
+                    "prompt_tokens": (existing_usage.get("prompt_tokens", 0) or 0) + (usage.get("prompt_tokens", 0) or 0),
+                    "completion_tokens": (existing_usage.get("completion_tokens", 0) or 0) + (usage.get("completion_tokens", 0) or 0),
+                    "total_tokens": (existing_usage.get("total_tokens", 0) or 0) + (usage.get("total_tokens", 0) or 0),
+                }
+                last_assistant.usage_json = json.dumps(merged)
+
+            await session.commit()
+    except Exception as e:
+        logger.error(f"追加优化历史失败: {e}")
 
 
 # ═══════════════════════════════════════════════════════
